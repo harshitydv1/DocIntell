@@ -13,9 +13,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Constants
-INDEX_FILE = "index.faiss"
-METADATA_FILE = "metadata.json"
-CHAT_HISTORY_FILE = "chat_history.json"
 MODEL_NAME = "all-MiniLM-L6-v2"
 CHUNK_SIZE = 400
 CHUNK_OVERLAP = 50
@@ -38,79 +35,30 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-def load_chat_history():
-    """Load chat history from local JSON file."""
-    if os.path.exists(CHAT_HISTORY_FILE):
-        with open(CHAT_HISTORY_FILE, "r") as f:
-            try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                pass
-    return []
-
-def save_chat_history(history):
-    """Save chat history to local JSON file."""
-    with open(CHAT_HISTORY_FILE, "w") as f:
-        json.dump(history, f)
-
 # Initialize Session State
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = load_chat_history()
+    st.session_state.chat_history = []
+if "faiss_index" not in st.session_state:
+    st.session_state.faiss_index = faiss.IndexFlatL2(384) # 384 is dimension for all-MiniLM-L6-v2
+if "metadata" not in st.session_state:
+    st.session_state.metadata = []
 
-@st.cache_resource
-def load_embedding_model():
-    """Load the SentenceTransformer model and cache it."""
-    return SentenceTransformer(MODEL_NAME)
-
-@st.cache_resource
-def get_groq_client():
-    """Initialize Groq client."""
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        try:
-            api_key = st.secrets["GROQ_API_KEY"]
-        except Exception:
-            pass
-            
-    if not api_key:
-        st.error("GROQ_API_KEY not found. Please add it to your .env file locally, or to Streamlit Secrets when deploying.")
-        st.stop()
-    return Groq(api_key=api_key)
-
-def init_or_load_faiss():
-    """Load existing FAISS index or create a new one."""
-    embed_dim = 384 # Output dimension of all-MiniLM-L6-v2
-    if os.path.exists(INDEX_FILE) and os.path.exists(METADATA_FILE):
-        index = faiss.read_index(INDEX_FILE)
-        with open(METADATA_FILE, "r") as f:
-            metadata = json.load(f)
-    else:
-        index = faiss.IndexFlatL2(embed_dim)
-        metadata = []
-    return index, metadata
-
-def save_faiss(index, metadata):
-    """Save FAISS index and metadata to disk."""
-    faiss.write_index(index, INDEX_FILE)
-    with open(METADATA_FILE, "w") as f:
-        json.dump(metadata, f)
-
-def remove_source_from_faiss(source_to_remove, index, metadata):
-    """Remove all chunks associated with a specific source from FAISS and metadata."""
+def remove_source_from_faiss(source_to_remove):
+    """Remove all chunks associated with a specific source from FAISS and metadata in session state."""
+    index = st.session_state.faiss_index
+    metadata = st.session_state.metadata
+    
     indices_to_keep = [i for i, meta in enumerate(metadata) if meta.get("source") != source_to_remove]
     
     if len(indices_to_keep) == 0:
-        embed_dim = 384
-        new_index = faiss.IndexFlatL2(embed_dim)
-        new_metadata = []
+        st.session_state.faiss_index = faiss.IndexFlatL2(384)
+        st.session_state.metadata = []
     else:
         embeddings_to_keep = np.array([index.reconstruct(i) for i in indices_to_keep]).astype("float32")
-        embed_dim = 384
-        new_index = faiss.IndexFlatL2(embed_dim)
+        new_index = faiss.IndexFlatL2(384)
         new_index.add(embeddings_to_keep)
-        new_metadata = [metadata[i] for i in indices_to_keep]
-        
-    save_faiss(new_index, new_metadata)
+        st.session_state.faiss_index = new_index
+        st.session_state.metadata = [metadata[i] for i in indices_to_keep]
 
 def extract_text(file):
     """Extract text from PDF or TXT file."""
@@ -139,6 +87,25 @@ def embed_texts(texts, model):
     embeddings = model.encode(texts, show_progress_bar=False)
     return np.array(embeddings).astype("float32")
 
+@st.cache_resource
+def load_embedding_model():
+    """Load the SentenceTransformer model and cache it."""
+    return SentenceTransformer(MODEL_NAME)
+
+@st.cache_resource
+def get_groq_client():
+    """Initialize Groq client."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        try:
+            api_key = st.secrets["GROQ_API_KEY"]
+        except Exception:
+            pass
+            
+    if not api_key:
+        st.error("GROQ_API_KEY not found. Please add it to your .env file locally, or to Streamlit Secrets when deploying.")
+        st.stop()
+    return Groq(api_key=api_key)
 # Main UI setup
 st.title("AI RAG Document Assistant")
 st.markdown("Upload documents and ask questions based on their content.")
@@ -152,7 +119,8 @@ with st.sidebar:
         if uploaded_files:
             with st.spinner("Processing documents..."):
                 model = load_embedding_model()
-                index, metadata = init_or_load_faiss()
+                index = st.session_state.faiss_index
+                metadata = st.session_state.metadata
                 
                 new_chunks = []
                 new_metadata = []
@@ -176,7 +144,6 @@ with st.sidebar:
                     embeddings = embed_texts(new_chunks, model)
                     index.add(embeddings)
                     metadata.extend(new_metadata)
-                    save_faiss(index, metadata)
                     st.success(f"Added {len(new_chunks)} chunks to the knowledge base!")
                 else:
                     st.warning("No readable text found in documents.")
@@ -186,7 +153,8 @@ with st.sidebar:
     st.divider()
     
     # Show stats
-    index, metadata = init_or_load_faiss()
+    index = st.session_state.faiss_index
+    metadata = st.session_state.metadata
     st.metric("Total Chunks in DB", len(metadata))
     
     if metadata:
@@ -202,20 +170,16 @@ with st.sidebar:
                 st.caption(f"📄 {source}: {count} chunks")
             with col2:
                 if st.button("X", key=f"del_{source}", help=f"Remove {source}"):
-                    remove_source_from_faiss(source, index, metadata)
+                    remove_source_from_faiss(source)
                     st.rerun()
     
     if st.button("Clear Chat History"):
         st.session_state.chat_history = []
-        if os.path.exists(CHAT_HISTORY_FILE):
-            os.remove(CHAT_HISTORY_FILE)
         st.rerun()
         
     if st.button("Clear Knowledge Base"):
-        if os.path.exists(INDEX_FILE):
-            os.remove(INDEX_FILE)
-        if os.path.exists(METADATA_FILE):
-            os.remove(METADATA_FILE)
+        st.session_state.faiss_index = faiss.IndexFlatL2(384)
+        st.session_state.metadata = []
         st.success("Knowledge base cleared!")
         st.rerun()
 
@@ -238,14 +202,15 @@ if user_query:
         st.markdown(user_query)
     
     st.session_state.chat_history.append({"role": "user", "content": user_query})
-    save_chat_history(st.session_state.chat_history)
+# Save call removed
     
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         
         # Retrieval
         model = load_embedding_model()
-        index, metadata = init_or_load_faiss()
+        index = st.session_state.faiss_index
+        metadata = st.session_state.metadata
         
         retrieved_context = []
         context_text = ""
@@ -303,10 +268,10 @@ CONTEXT:
                 "content": full_response,
                 "context": retrieved_context
             })
-            save_chat_history(st.session_state.chat_history)
+        # Save call removed
             
         except Exception as e:
             error_msg = f"Error generating response: {str(e)}"
             message_placeholder.error(error_msg)
             st.session_state.chat_history.append({"role": "assistant", "content": error_msg})
-            save_chat_history(st.session_state.chat_history)
+        # Save call removed
